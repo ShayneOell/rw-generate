@@ -1,0 +1,16 @@
+<?php
+
+/**
+ * @file
+ * Contains rw_generate.module.
+ */
+
+/**
+ * Implements hook_help().
+ */
+function rw_generate_help($route_name, \Drupal\Core\Routing\RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.rw_generate':
+      return t('This module generates nodes using AI content.');
+  }
+}

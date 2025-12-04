@@ -1,0 +1,8 @@
+name: 'RW Generate'
+type: module
+description: 'Generates nodes with AI content (title, body, images) using Google ADK.'
+core_version_requirement: ^10 || ^11
+package: 'Custom'
+dependencies:
+  - drupal:node
+  - drupal:media

@@ -1,0 +1,7 @@
+rw_generate.generate_form:
+  path: '/admin/content/rw-generate'
+  defaults:
+    _form: '\Drupal\rw_generate\Form\RWGenerateForm'
+    _title: 'Generate AI Content'
+  requirements:
+    _permission: 'administer nodes'
