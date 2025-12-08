@@ -1,7 +1,15 @@
-rw_generate.generate_form:
-  path: '/admin/content/rw-generate'
+rw_generate.form:
+  path: '/admin/config/development/rw-generate'
   defaults:
     _form: '\Drupal\rw_generate\Form\RWGenerateForm'
-    _title: 'Generate AI Content'
+    _title: 'RW Generate'
   requirements:
-    _permission: 'administer nodes'
+    _permission: 'access administration pages'
+
+rw_generate.deletion_form:
+  path: '/admin/config/development/rw-generate/delete'
+  defaults:
+    _form: '\Drupal\rw_generate\Form\DeleteGeneratedContentForm'
+    _title: 'Delete Generated Content'
+  requirements:
+    _permission: 'access administration pages'
