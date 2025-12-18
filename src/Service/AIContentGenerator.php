@@ -10,8 +10,8 @@ use GuzzleHttp\Client;
 use Drupal\Core\Entity\EntityTypeManagerInterface;
 use Drupal\file\Entity\File;
 use Drupal\media\Entity\Media;
-use Drupal\taxonomy\Entity\Term;
 use Drupal\node\Entity\Node;
+use Drupal\user\Entity\User;
 use Drupal\Core\File\FileSystemInterface;
 use Drupal\Core\Entity\EntityFieldManagerInterface;
 use Drupal\Core\Entity\EntityTypeBundleInfoInterface;
@@ -21,6 +21,7 @@ use Drupal\Core\Field\FieldStorageDefinitionInterface;
 use Drupal\Core\StringTranslation\TranslationManager;
 use Drupal\Core\Entity\Entity\EntityFormDisplay;
 use Drupal\Core\Entity\Entity\EntityViewDisplay;
+use Drupal\Core\Password\PasswordGeneratorInterface;
 
 class AIContentGenerator
 {
@@ -34,9 +35,10 @@ class AIContentGenerator
   private EntityFieldManagerInterface $entityFieldManager;
   private EntityTypeBundleInfoInterface $entityTypeBundleInfo;
   private TranslationManager $stringTranslation;
+  private PasswordGeneratorInterface $passwordGenerator;
 
 
-  public function __construct(Client $client, FileSystemInterface $fileSystem, ModuleHandlerInterface $moduleHandler, ConfigFactoryInterface $configFactory, EntityTypeManagerInterface $entityTypeManager, EntityFieldManagerInterface $entityFieldManager, EntityTypeBundleInfoInterface $entityTypeBundleInfo, TranslationManager $stringTranslation)
+  public function __construct(Client $client, FileSystemInterface $fileSystem, ModuleHandlerInterface $moduleHandler, ConfigFactoryInterface $configFactory, EntityTypeManagerInterface $entityTypeManager, EntityFieldManagerInterface $entityFieldManager, EntityTypeBundleInfoInterface $entityTypeBundleInfo, TranslationManager $stringTranslation, PasswordGeneratorInterface $passwordGenerator)
   {
     $this->client = $client;
     $this->apiKey = getenv('GEMINI_API_KEY') ?: '';
@@ -48,6 +50,8 @@ class AIContentGenerator
     $this->entityFieldManager = $entityFieldManager;
     $this->entityTypeBundleInfo = $entityTypeBundleInfo;
     $this->stringTranslation = $stringTranslation;
+    $this->passwordGenerator = $passwordGenerator;
+    
   }
 
   public static function create(ContainerInterface $container)
@@ -60,7 +64,8 @@ class AIContentGenerator
       $container->get('entity_type.manager'),
       $container->get('entity_field.manager'),
       $container->get('entity_type.bundle.info'),
-      $container->get('string_translation')
+      $container->get('string_translation'),
+      $container->get('password_generator')
     );
   }
 
@@ -82,8 +87,7 @@ class AIContentGenerator
 
     shuffle($promptCombinations);
 
-    $term = $this->entityTypeManager->getStorage('taxonomy_term')->loadByProperties(['vid' => 'rw_generated', 'name' => 'Generated']);
-    $generatedTerm = reset($term);
+    $aiUser = $this->getAIUser();
 
     for ($i = 0; $i < $count; $i++) {
       $node = NULL;
@@ -94,19 +98,11 @@ class AIContentGenerator
           continue;
         }
 
-        $this->ensureGeneratedTagFieldExists('node', $contentType);
-
         $node = Node::create([
           'type' => $contentType,
-          'title' => 'Generating...',
+          'title' => 'Generating...', 
+          'uid' => $aiUser->id(),
         ]);
-
-        if ($generatedTerm) {
-          $node->get('field_rw_generated_tag')->appendItem($generatedTerm);
-        } elseif (!$generatedTerm) {
-          \Drupal::logger('rw_generate')->warning('Taxonomy term "Generated" not found. Node will not be tagged.', ['@type' => $contentType]);
-        }
-
 
         $currentPromptParameters = $promptCombinations[$i] ?? [];
         $field_definitions = \Drupal::service('entity_field.manager')->getFieldDefinitions('node', $contentType);
@@ -206,7 +202,9 @@ class AIContentGenerator
       throw new \Exception('No text returned from Gemini.');
     }
 
-    $lines = preg_split("/\r?\n/", $fullText, 2);
+    $lines = preg_split("/
+?
+/", $fullText, 2);
     $title = trim($lines[0]) ?: 'AI Generated Title';
     $bodyText = isset($lines[1]) ? trim($lines[1]) : trim($lines[0]);
     $bodyHtml = '<p>' . nl2br($bodyText) . '</p>';
@@ -220,9 +218,7 @@ class AIContentGenerator
   private function generateAIImage(string $imageKeyword = 'abstract image'): ?int
   {
     $time = time();
-
-    $term = $this->entityTypeManager->getStorage('taxonomy_term')->loadByProperties(['vid' => 'rw_generated', 'name' => 'Generated']);
-    $generatedTerm = reset($term);
+    $aiUser = $this->getAIUser();
 
     if (empty($this->apiKey)) {
       \Drupal::logger('rw_generate')->error('GEMINI_API_KEY not set.');
@@ -282,7 +278,7 @@ class AIContentGenerator
         default      => 'png',
       };
 
-      $imageName = 'ai_image_' . $time . '_' . uniqid() . '.' . $ext;
+      $imageName = 'ai_image_' . $time . '_' . uniqid() . '.' . $ext; //potential deletion mechanic
       $uri = 'public://' . $imageName;
 
       $file_saved = $this->fileSystem->saveData($imageBinary, $uri, FileSystemInterface::EXISTS_REPLACE);
@@ -292,9 +288,7 @@ class AIContentGenerator
       }
       \Drupal::logger('rw_generate')->debug('Image file saved to: @uri', ['@uri' => $uri]);
 
-      $this->ensureGeneratedTagFieldExists('media', 'image');
-
-      $file = File::create(['uri' => $uri, 'status' => 1]);
+      $file = File::create(['uri' => $uri, 'status' => 1, 'uid' => $aiUser->id()]);
       $file->save();
       \Drupal::logger('rw_generate')->debug('File entity created with ID: @id', ['@id' => $file->id()]);
 
@@ -302,14 +296,9 @@ class AIContentGenerator
         'bundle' => 'image',
         'name' => $imageName,
         'status' => 1,
-        'field_media_image' => ['target_id' => $file->id()],
+        'uid' => $aiUser->id(),
+        'field_media_image' => ['target_id' => $file->id()]
       ]);
-
-      if ($generatedTerm) {
-        $media->get('field_rw_generated_tag')->appendItem($generatedTerm);
-      } elseif (!$generatedTerm) {
-        \Drupal::logger('rw_generate')->warning('Taxonomy term "Generated" not found. Media will not be tagged.');
-      }
 
       $media->save();
 
@@ -322,124 +311,49 @@ class AIContentGenerator
 
   private function createPlaceholderMedia(int $time): int
   {
-    $term = $this->entityTypeManager->getStorage('taxonomy_term')->loadByProperties(['vid' => 'rw_generated', 'name' => 'Generated']);
-    $generatedTerm = reset($term);
+    $aiUser = $this->getAIUser();
+    $placeholderName = 'ai_placeholder_image_' . $time . '.png';
+    $placeholderBinary = base64_decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQMAAAAl21bKAAAAA1BMVEUAAACnej3aAAAAAXRSTlMAQObYZgAAAApJREFUCNdjYAAAAAIAAeIhvDMAAAAASUVORK5CYII=');
+    $uri = 'public://' . $placeholderName;
 
-        $this->ensureGeneratedTagFieldExists('media', 'image');
-    
-        $placeholderName = 'ai_placeholder_image_' . $time . '.png';
-        $placeholderBinary = base64_decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQMAAAAl21bKAAAAA1BMVEUAAACnej3aAAAAAXRSTlMAQObYZgAAAApJREFUCNdjYAAAAAIAAeIhvDMAAAAASUVORK5CYII=');
-        $uri = 'public://' . $placeholderName;
-    
-        $file_saved = $this->fileSystem->saveData($placeholderBinary, $uri, FileSystemInterface::EXISTS_REPLACE);
-        if ($file_saved === FALSE) {
-          \Drupal::logger('rw_generate')->error('Failed to save placeholder image file to @uri.', ['@uri' => $uri]);
-          return 0;
-        }
-        \Drupal::logger('rw_generate')->debug('Placeholder image file saved to: @uri', ['@uri' => $uri]);
-    
-        $file = File::create(['uri' => $uri, 'status' => 1]);
-        $file->save();
-        \Drupal::logger('rw_generate')->debug('File entity for placeholder created with ID: @id', ['@id' => $file->id()]);
-    
-        $media = Media::create([
-          'bundle' => 'image',
-          'name' => $placeholderName,
-          'status' => 1,
-          'field_media_image' => ['target_id' => $file->id()],
-        ]);
-    if ($generatedTerm) {
-      $media->get('field_rw_generated_tag')->appendItem($generatedTerm);
-    } elseif (!$generatedTerm) {
-      \Drupal::logger('rw_generate')->warning('Taxonomy term "Generated" not found. Media will not be tagged.');
+    $file_saved = $this->fileSystem->saveData($placeholderBinary, $uri, FileSystemInterface::EXISTS_REPLACE);
+    if ($file_saved === FALSE) {
+      \Drupal::logger('rw_generate')->error('Failed to save placeholder image file to @uri.', ['@uri' => $uri]);
+      return 0;
     }
+    \Drupal::logger('rw_generate')->debug('Placeholder image file saved to: @uri', ['@uri' => $uri]);
+
+    $file = File::create(['uri' => $uri, 'status' => 1, 'uid' => $aiUser->id()]);
+    $file->save();
+    \Drupal::logger('rw_generate')->debug('File entity for placeholder created with ID: @id', ['@id' => $file->id()]);
+
+    $media = Media::create([
+      'bundle' => 'image',
+      'name' => $placeholderName,
+      'status' => 1,
+      'uid' => $aiUser->id(),
+      'field_media_image' => ['target_id' => $file->id()]
+    ]);
     $media->save();
     return $media->id();
   }
 
-  private function ensureGeneratedTagFieldExists(string $entity_type_id, string $bundle_id): void
+  private function getAIUser(): User
   {
-
-    $field_name = 'field_rw_generated_tag';
-    $field_storage_id = $entity_type_id . '.' . $field_name;
-
-    if (!FieldStorageConfig::load($field_storage_id)) {
-      $field_storage = FieldStorageConfig::create([
-        'field_name' => $field_name,
-        'entity_type' => $entity_type_id,
-        'type' => 'entity_reference',
-        'settings' => [
-          'target_type' => 'taxonomy_term',
-        ],
-        'cardinality' => FieldStorageDefinitionInterface::CARDINALITY_UNLIMITED,
-        'translatable' => TRUE,
-        'locked' => FALSE,
-        'indexes' => ['target_id' => ['target_id']],
+    $user_storage = $this->entityTypeManager->getStorage('user');
+    $ai_users = $user_storage->loadByProperties(['name' => 'AI Content Generator']);
+    if ($ai_users) {
+      return reset($ai_users);
+    } else {
+      $user = User::create([
+        'name' => 'AI Content Generator',
+        'mail' => 'ai@example.com',
+        'pass' => $this->passwordGenerator->generate(),
+        'status' => 1,
       ]);
-      $field_storage->save();
-      $this->entityFieldManager->clearCachedFieldDefinitions();
-      \Drupal::logger('rw_generate')->notice('Created field storage {id} for {entity_type_id}.', ['id' => $field_storage_id, 'entity_type_id' => $entity_type_id]);
+      $user->save();
+      return $user;
     }
-
-    $field_id = $entity_type_id . '.' . $bundle_id . '.' . $field_name;
-    if (!FieldConfig::load($field_id)) {
-      $field = FieldConfig::create([
-        'field_storage' => FieldStorageConfig::load($field_storage_id),
-        'bundle' => $bundle_id,
-        'label' => $this->stringTranslation->translate('Generated Tag'),
-        'description' => $this->stringTranslation->translate('Tag indicating content was generated by the RW Generate module.'),
-        'required' => FALSE,
-        'default_value' => [],
-        'settings' => [
-          'handler' => 'default:taxonomy_term',
-          'handler_settings' => [
-            'target_bundles' => [
-              'rw_generated' => 'rw_generated',
-            ],
-            'auto_create' => FALSE,
-          ],
-        ],
-        'third_party_settings' => [],
-      ]);
-      $field->save();
-      $this->entityFieldManager->clearCachedFieldDefinitions();
-      \Drupal::logger('rw_generate')->notice('Created field instance {id} for bundle {bundle_id}.', ['id' => $field_id, 'bundle_id' => $bundle_id]);
-
-      $this->assignFieldToDisplays($entity_type_id, $bundle_id, $field_name);
-      
-      \Drupal::service('cache_tags.invalidator')->invalidateTags([
-        'config:core.entity_view_display.' . $entity_type_id . '.' . $bundle_id . '.default',
-        'config:core.entity_form_display.' . $entity_type_id . '.' . $bundle_id . '.default',
-        'rendered',
-      ]);
-    }
-  }
-
-  private function assignFieldToDisplays(string $entity_type_id, string $bundle_id, string $field_name): void
-  {
-    $form_display = EntityFormDisplay::load($entity_type_id . '.' . $bundle_id . '.default');
-    if (!$form_display) {
-      $form_display = EntityFormDisplay::create([
-        'targetEntityType' => $entity_type_id,
-        'bundle' => $bundle_id,
-        'mode' => 'default',
-        'status' => TRUE,
-      ]);
-    }
-    $form_display->setComponent($field_name, ['region' => 'hidden']); //this is supposed to hide the field from the form but that isnt the case, need to investigate futher
-    $form_display->save();
-
-    $view_display = EntityViewDisplay::load($entity_type_id . '.' . $bundle_id . '.default');
-    if (!$view_display) {
-      $view_display = EntityViewDisplay::create([
-        'targetEntityType' => $entity_type_id,
-        'bundle' => $bundle_id,
-        'mode' => 'default',
-        'status' => TRUE,
-      ]);
-    }
-    $view_display->setComponent($field_name, ['region' => 'hidden']); 
-    $view_display->save();
   }
 
   private function loadSiteContext(): array

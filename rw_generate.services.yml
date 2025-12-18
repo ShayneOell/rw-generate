@@ -1,4 +1,4 @@
 services:
   rw_generate.ai_generator:
     class: Drupal\rw_generate\Service\AIContentGenerator
-    arguments: ['@http_client', '@file_system', '@module_handler', '@config.factory', '@entity_type.manager', '@entity_field.manager', '@entity_type.bundle.info', '@string_translation']
+    arguments: ['@http_client', '@file_system', '@module_handler', '@config.factory', '@entity_type.manager', '@entity_field.manager', '@entity_type.bundle.info', '@string_translation', '@password_generator']
