@@ -7,11 +7,21 @@ use Symfony\Component\Yaml\Yaml;
 use Drupal\Core\Config\ConfigFactoryInterface;
 use Symfony\Component\DependencyInjection\ContainerInterface;
 use GuzzleHttp\Client;
-use Drupal\file\FileInterface;
-use Drupal\file\Entity\File;;
+use Drupal\Core\Entity\EntityTypeManagerInterface;
+use Drupal\file\Entity\File;
 use Drupal\media\Entity\Media;
 use Drupal\node\Entity\Node;
+use Drupal\user\Entity\User;
 use Drupal\Core\File\FileSystemInterface;
+use Drupal\Core\Entity\EntityFieldManagerInterface;
+use Drupal\Core\Entity\EntityTypeBundleInfoInterface;
+use Drupal\field\Entity\FieldStorageConfig;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\Core\Field\FieldStorageDefinitionInterface;
+use Drupal\Core\StringTranslation\TranslationManager;
+use Drupal\Core\Entity\Entity\EntityFormDisplay;
+use Drupal\Core\Entity\Entity\EntityViewDisplay;
+use Drupal\Core\Password\PasswordGeneratorInterface;
 
 class AIContentGenerator
 {
@@ -21,8 +31,14 @@ class AIContentGenerator
   private ModuleHandlerInterface $moduleHandler;
   private ConfigFactoryInterface $configFactory;
   private array $siteContext;
+  private EntityTypeManagerInterface $entityTypeManager;
+  private EntityFieldManagerInterface $entityFieldManager;
+  private EntityTypeBundleInfoInterface $entityTypeBundleInfo;
+  private TranslationManager $stringTranslation;
+  private PasswordGeneratorInterface $passwordGenerator;
 
-  public function __construct(Client $client, FileSystemInterface $fileSystem, ModuleHandlerInterface $moduleHandler, ConfigFactoryInterface $configFactory)
+
+  public function __construct(Client $client, FileSystemInterface $fileSystem, ModuleHandlerInterface $moduleHandler, ConfigFactoryInterface $configFactory, EntityTypeManagerInterface $entityTypeManager, EntityFieldManagerInterface $entityFieldManager, EntityTypeBundleInfoInterface $entityTypeBundleInfo, TranslationManager $stringTranslation, PasswordGeneratorInterface $passwordGenerator)
   {
     $this->client = $client;
     $this->apiKey = getenv('GEMINI_API_KEY') ?: '';
@@ -30,6 +46,12 @@ class AIContentGenerator
     $this->moduleHandler = $moduleHandler;
     $this->configFactory = $configFactory;
     $this->siteContext = $this->loadSiteContext();
+    $this->entityTypeManager = $entityTypeManager;
+    $this->entityFieldManager = $entityFieldManager;
+    $this->entityTypeBundleInfo = $entityTypeBundleInfo;
+    $this->stringTranslation = $stringTranslation;
+    $this->passwordGenerator = $passwordGenerator;
+    
   }
 
   public static function create(ContainerInterface $container)
@@ -38,11 +60,16 @@ class AIContentGenerator
       $container->get('http_client'),
       $container->get('file_system'),
       $container->get('module_handler'),
-      $container->get('config.factory')
+      $container->get('config.factory'),
+      $container->get('entity_type.manager'),
+      $container->get('entity_field.manager'),
+      $container->get('entity_type.bundle.info'),
+      $container->get('string_translation'),
+      $container->get('password_generator')
     );
   }
 
-  public function generateNodes(int $count, string $contentType, bool $generateImages): int
+  public function generateNodes(int $count, string $contentType, bool $generateImages, array $fields = []): int
   {
     $created = 0;
     $context = $this->siteContext['default_site_context'] ?? [];
@@ -51,14 +78,16 @@ class AIContentGenerator
     $imageKeywords = $context['image_keywords'] ?? ['abstract image'];
 
     $promptCombinations = [];
-    
+
     for ($i = 0; $i < $count; $i++) {
       $topic = $topics[$i % count($topics)];
       $variation = $variations[$i % count($variations)];
       $promptCombinations[] = ['topic' => $topic, 'variation' => $variation];
     }
-    
+
     shuffle($promptCombinations);
+
+    $aiUser = $this->getAIUser();
 
     for ($i = 0; $i < $count; $i++) {
       $node = NULL;
@@ -71,40 +100,45 @@ class AIContentGenerator
 
         $node = Node::create([
           'type' => $contentType,
-          'title' => 'Generating...',
-          'body' => [
-            'value' => '<p>Generating content...</p>',
-            'format' => 'full_html',
-          ],
-          'status' => 1,
+          'title' => 'Generating...', 
+          'uid' => $aiUser->id(),
         ]);
-        $node->save();
 
         $currentPromptParameters = $promptCombinations[$i] ?? [];
-        $textData = $this->generateAIText($currentPromptParameters);
-        $node->setTitle($textData['title']);
-        $node->set('body', [
-          'value' => $textData['body'],
-          'format' => 'full_html',
-        ]);
+        $field_definitions = \Drupal::service('entity_field.manager')->getFieldDefinitions('node', $contentType);
 
-        if ($generateImages) {
-          if ($node->hasField('field_image')) {
-            $imageKeyword = $imageKeywords[$i % count($imageKeywords)];
-            if (empty($imageKeyword) && !empty($textData['title'])) {
-                $imageKeyword = $textData['title'];
+        foreach ($fields as $field_name) {
+          if ($node->hasField($field_name)) {
+            $field_definition = $field_definitions[$field_name];
+            $field_type = $field_definition->getType();
+            if (in_array($field_type, ['text', 'text_long', 'text_with_summary', 'string'])) {
+              $textData = $this->generateAIText($currentPromptParameters, $field_definition->getLabel());
+              if ($field_name == 'title') {
+                $node->setTitle($textData['title']);
+              } else {
+                $node->set($field_name, [
+                  'value' => $textData['body'],
+                  'format' => 'full_html',
+                ]);
+              }
+            } elseif ($field_type == 'entity_reference' && $field_definition->getSetting('target_type') == 'media' && $generateImages) {
+              $imageKeyword = $imageKeywords[$i % count($imageKeywords)];
+              $mediaId = $this->generateAIImage($imageKeyword);
+              if ($mediaId) {
+                $alt_text = 'AI generated image';
+                try {
+                  $alt_text = $this->generateAIText($currentPromptParameters, 'Image alt text')['title'];
+                } catch (\Exception $e) {
+                  \Drupal::logger('rw_generate')->warning('Failed to generate alt text: @msg', ['@msg' => $e->getMessage()]);
+                }
+                $node->set($field_name, [
+                  [
+                    'target_id' => $mediaId,
+                    'alt' => $alt_text,
+                  ]
+                ]);
+              }
             }
-            $mediaId = $this->generateAIImage($imageKeyword);
-            if ($mediaId) {
-              $node->set('field_image', [
-                [
-                  'target_id' => $mediaId,
-                  'alt' => $textData['title'],
-                ]
-              ]);
-            }
-          } else {
-            \Drupal::logger('rw_generate')->warning('Content type "@type" does not have an "field_image" field. Skipping image generation for this node.', ['@type' => $contentType]);
           }
         }
 
@@ -123,14 +157,14 @@ class AIContentGenerator
     return $created;
   }
 
-  private function generateAIText(array $promptParameters = []): array
+  private function generateAIText(array $promptParameters = [], string $field_label = 'text'): array
   {
     if (empty($this->apiKey)) {
       throw new \Exception('GEMINI_API_KEY not set.');
     }
 
     $context = $this->siteContext['default_site_context'] ?? [];
-    $basePrompt = $context['base_prompt'] ?? 'Write about {topic}. {variation}.';
+    $basePrompt = $context['base_prompt'] ?? 'Write a {field_label} about {topic}. {variation}.';
     $topics = $context['topics'] ?? ['a general topic'];
     $variations = $context['variations'] ?? ['with interesting details'];
 
@@ -138,8 +172,8 @@ class AIContentGenerator
     $selectedVariation = $promptParameters['variation'] ?? $variations[array_rand($variations)];
 
     $prompt = str_replace(
-      ['{topic}', '{variation}'],
-      [$selectedTopic, $selectedVariation],
+      ['{field_label}', '{topic}', '{variation}'],
+      [$field_label, $selectedTopic, $selectedVariation],
       $basePrompt
     );
 
@@ -168,7 +202,9 @@ class AIContentGenerator
       throw new \Exception('No text returned from Gemini.');
     }
 
-    $lines = preg_split("/\r?\n/", $fullText, 2);
+    $lines = preg_split("/
+?
+/", $fullText, 2);
     $title = trim($lines[0]) ?: 'AI Generated Title';
     $bodyText = isset($lines[1]) ? trim($lines[1]) : trim($lines[0]);
     $bodyHtml = '<p>' . nl2br($bodyText) . '</p>';
@@ -182,6 +218,7 @@ class AIContentGenerator
   private function generateAIImage(string $imageKeyword = 'abstract image'): ?int
   {
     $time = time();
+    $aiUser = $this->getAIUser();
 
     if (empty($this->apiKey)) {
       \Drupal::logger('rw_generate')->error('GEMINI_API_KEY not set.');
@@ -222,12 +259,14 @@ class AIContentGenerator
       }
 
       if (!$inline || empty($inline['data'])) {
-        return $this->createPlaceholderMedia($title, $time);
+        \Drupal::logger('rw_generate')->warning('No inline image data found in Gemini response. Image generation failed or returned empty data.');
+        return $this->createPlaceholderMedia($time);
       }
 
       $imageBinary = base64_decode($inline['data'], true);
       if ($imageBinary === false) {
-        return $this->createPlaceholderMedia($title, $time);
+        \Drupal::logger('rw_generate')->error('Failed to base64 decode image data from Gemini. Raw data length: @length', ['@length' => strlen($inline['data'])]);
+        return $this->createPlaceholderMedia($time);
       }
 
       $mimeType = $inline['mimeType'] ?? 'image/png';
@@ -239,52 +278,84 @@ class AIContentGenerator
         default      => 'png',
       };
 
-      $imageName = 'ai_image_' . $time . '_' . uniqid() . '.' . $ext;
+      $imageName = 'ai_image_' . $time . '_' . uniqid() . '.' . $ext; //potential deletion mechanic
       $uri = 'public://' . $imageName;
 
-      $this->fileSystem->saveData($imageBinary, $uri, FileSystemInterface::EXISTS_REPLACE);
+      $file_saved = $this->fileSystem->saveData($imageBinary, $uri, FileSystemInterface::EXISTS_REPLACE);
+      if ($file_saved === FALSE) {
+        \Drupal::logger('rw_generate')->error('Failed to save image file to @uri.', ['@uri' => $uri]);
+        return $this->createPlaceholderMedia($time);
+      }
+      \Drupal::logger('rw_generate')->debug('Image file saved to: @uri', ['@uri' => $uri]);
 
-      $file = File::create(['uri' => $uri, 'status' => 1]);
+      $file = File::create(['uri' => $uri, 'status' => 1, 'uid' => $aiUser->id()]);
       $file->save();
+      \Drupal::logger('rw_generate')->debug('File entity created with ID: @id', ['@id' => $file->id()]);
 
       $media = Media::create([
         'bundle' => 'image',
         'name' => $imageName,
         'status' => 1,
-        'field_media_image' => ['target_id' => $file->id()],
+        'uid' => $aiUser->id(),
+        'field_media_image' => ['target_id' => $file->id()]
       ]);
+
       $media->save();
 
       return $media->id();
     } catch (\Exception $e) {
       \Drupal::logger('rw_generate')->error('Gemini API failure: @msg', ['@msg' => $e->getMessage()]);
-      return $this->createPlaceholderMedia($title, $time);
+      return $this->createPlaceholderMedia($time);
     }
   }
 
-  private function createPlaceholderMedia(string $title, int $time): int
+  private function createPlaceholderMedia(int $time): int
   {
+    $aiUser = $this->getAIUser();
     $placeholderName = 'ai_placeholder_image_' . $time . '.png';
     $placeholderBinary = base64_decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQMAAAAl21bKAAAAA1BMVEUAAACnej3aAAAAAXRSTlMAQObYZgAAAApJREFUCNdjYAAAAAIAAeIhvDMAAAAASUVORK5CYII=');
     $uri = 'public://' . $placeholderName;
 
-    $this->fileSystem->saveData($placeholderBinary, $uri, FileSystemInterface::EXISTS_REPLACE);
+    $file_saved = $this->fileSystem->saveData($placeholderBinary, $uri, FileSystemInterface::EXISTS_REPLACE);
+    if ($file_saved === FALSE) {
+      \Drupal::logger('rw_generate')->error('Failed to save placeholder image file to @uri.', ['@uri' => $uri]);
+      return 0;
+    }
+    \Drupal::logger('rw_generate')->debug('Placeholder image file saved to: @uri', ['@uri' => $uri]);
 
-    $file = File::create(['uri' => $uri, 'status' => 1]);
+    $file = File::create(['uri' => $uri, 'status' => 1, 'uid' => $aiUser->id()]);
     $file->save();
+    \Drupal::logger('rw_generate')->debug('File entity for placeholder created with ID: @id', ['@id' => $file->id()]);
 
     $media = Media::create([
       'bundle' => 'image',
       'name' => $placeholderName,
       'status' => 1,
-      'field_media_image' => ['target_id' => $file->id()],
+      'uid' => $aiUser->id(),
+      'field_media_image' => ['target_id' => $file->id()]
     ]);
     $media->save();
-  
-
     return $media->id();
   }
-  
+
+  private function getAIUser(): User
+  {
+    $user_storage = $this->entityTypeManager->getStorage('user');
+    $ai_users = $user_storage->loadByProperties(['name' => 'AI Content Generator']);
+    if ($ai_users) {
+      return reset($ai_users);
+    } else {
+      $user = User::create([
+        'name' => 'AI Content Generator',
+        'mail' => 'ai@example.com',
+        'pass' => $this->passwordGenerator->generate(),
+        'status' => 1,
+      ]);
+      $user->save();
+      return $user;
+    }
+  }
+
   private function loadSiteContext(): array
   {
     $modulePath = $this->moduleHandler->getModule('rw_generate')->getPath();
@@ -303,5 +374,3 @@ class AIContentGenerator
     }
   }
 }
-
-

@@ -1,0 +1,6 @@
+rw_generate.admin_settings:
+  title: 'RW Generate'
+  description: 'Generate AI content for your site.'
+  parent: system.admin_config_development
+  route_name: rw_generate.form
+  weight: 100
