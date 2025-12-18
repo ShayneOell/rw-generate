@@ -2,36 +2,63 @@
 
 namespace Drupal\rw_generate\Service;
 
-use Drupal\node\Entity\Node;
-use Drupal\media\Entity\Media;
-use Drupal\file\Entity\File;
-use Drupal\Core\File\FileSystemInterface;
+use Drupal\Core\Extension\ModuleHandlerInterface;
+use Symfony\Component\Yaml\Yaml;
+use Drupal\Core\Config\ConfigFactoryInterface;
+use Symfony\Component\DependencyInjection\ContainerInterface;
 use GuzzleHttp\Client;
+use Drupal\file\FileInterface;
+use Drupal\file\Entity\File;;
+use Drupal\media\Entity\Media;
+use Drupal\node\Entity\Node;
+use Drupal\Core\File\FileSystemInterface;
 
 class AIContentGenerator
 {
   private Client $client;
   private string $apiKey;
   private FileSystemInterface $fileSystem;
+  private ModuleHandlerInterface $moduleHandler;
+  private ConfigFactoryInterface $configFactory;
+  private array $siteContext;
 
-  public function __construct(Client $client, FileSystemInterface $fileSystem)
+  public function __construct(Client $client, FileSystemInterface $fileSystem, ModuleHandlerInterface $moduleHandler, ConfigFactoryInterface $configFactory)
   {
     $this->client = $client;
     $this->apiKey = getenv('GEMINI_API_KEY') ?: '';
     $this->fileSystem = $fileSystem;
+    $this->moduleHandler = $moduleHandler;
+    $this->configFactory = $configFactory;
+    $this->siteContext = $this->loadSiteContext();
   }
 
   public static function create(ContainerInterface $container)
   {
     return new static(
       $container->get('http_client'),
-      $container->get('file_system')
+      $container->get('file_system'),
+      $container->get('module_handler'),
+      $container->get('config.factory')
     );
   }
 
   public function generateNodes(int $count, string $contentType, bool $generateImages): int
   {
     $created = 0;
+    $context = $this->siteContext['default_site_context'] ?? [];
+    $topics = $context['topics'] ?? ['general topic'];
+    $variations = $context['variations'] ?? ['interesting details'];
+    $imageKeywords = $context['image_keywords'] ?? ['abstract image'];
+
+    $promptCombinations = [];
+    
+    for ($i = 0; $i < $count; $i++) {
+      $topic = $topics[$i % count($topics)];
+      $variation = $variations[$i % count($variations)];
+      $promptCombinations[] = ['topic' => $topic, 'variation' => $variation];
+    }
+    
+    shuffle($promptCombinations);
 
     for ($i = 0; $i < $count; $i++) {
       $node = NULL;
@@ -53,7 +80,8 @@ class AIContentGenerator
         ]);
         $node->save();
 
-        $textData = $this->generateAIText($contentType);
+        $currentPromptParameters = $promptCombinations[$i] ?? [];
+        $textData = $this->generateAIText($currentPromptParameters);
         $node->setTitle($textData['title']);
         $node->set('body', [
           'value' => $textData['body'],
@@ -62,7 +90,11 @@ class AIContentGenerator
 
         if ($generateImages) {
           if ($node->hasField('field_image')) {
-            $mediaId = $this->generateAIImage($textData['title']);
+            $imageKeyword = $imageKeywords[$i % count($imageKeywords)];
+            if (empty($imageKeyword) && !empty($textData['title'])) {
+                $imageKeyword = $textData['title'];
+            }
+            $mediaId = $this->generateAIImage($imageKeyword);
             if ($mediaId) {
               $node->set('field_image', [
                 [
@@ -91,15 +123,24 @@ class AIContentGenerator
     return $created;
   }
 
-  private function generateAIText(string $contentType): array
+  private function generateAIText(array $promptParameters = []): array
   {
     if (empty($this->apiKey)) {
       throw new \Exception('GEMINI_API_KEY not set.');
     }
 
-    $prompt = sprintf(
-      'Write a short %s about Cape Town. The first line should be the title, followed by the body text.',
-      $contentType === 'article' ? 'blog post' : 'page content'
+    $context = $this->siteContext['default_site_context'] ?? [];
+    $basePrompt = $context['base_prompt'] ?? 'Write about {topic}. {variation}.';
+    $topics = $context['topics'] ?? ['a general topic'];
+    $variations = $context['variations'] ?? ['with interesting details'];
+
+    $selectedTopic = $promptParameters['topic'] ?? $topics[array_rand($topics)];
+    $selectedVariation = $promptParameters['variation'] ?? $variations[array_rand($variations)];
+
+    $prompt = str_replace(
+      ['{topic}', '{variation}'],
+      [$selectedTopic, $selectedVariation],
+      $basePrompt
     );
 
     $response = $this->client->post(
@@ -138,7 +179,7 @@ class AIContentGenerator
     ];
   }
 
-  private function generateAIImage(string $title): ?int
+  private function generateAIImage(string $imageKeyword = 'abstract image'): ?int
   {
     $time = time();
 
@@ -159,7 +200,7 @@ class AIContentGenerator
             'contents' => [
               [
                 'role' => 'user',
-                'parts' => [['text' => 'Cape Town cityscape']],
+                'parts' => [['text' => $imageKeyword]],
               ],
             ],
           ],
@@ -239,8 +280,27 @@ class AIContentGenerator
       'field_media_image' => ['target_id' => $file->id()],
     ]);
     $media->save();
+  
 
     return $media->id();
+  }
+  
+  private function loadSiteContext(): array
+  {
+    $modulePath = $this->moduleHandler->getModule('rw_generate')->getPath();
+    $configFilePath = $modulePath . '/config/site.context.yml';
+
+    if (!file_exists($configFilePath)) {
+      \Drupal::logger('rw_generate')->error('site.context.yml not found at @path', ['@path' => $configFilePath]);
+      return [];
+    }
+
+    try {
+      return Yaml::parseFile($configFilePath);
+    } catch (\Exception $e) {
+      \Drupal::logger('rw_generate')->error('Error parsing site.context.yml: @msg', ['@msg' => $e->getMessage()]);
+      return [];
+    }
   }
 }
 

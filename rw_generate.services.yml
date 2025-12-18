@@ -1,4 +1,4 @@
 services:
   rw_generate.ai_generator:
     class: Drupal\rw_generate\Service\AIContentGenerator
-    arguments: ['@http_client', '@file_system']
+    arguments: ['@http_client', '@file_system', '@module_handler', '@config.factory']
