@@ -1,4 +1,10 @@
 services:
-  rw_generate.ai_generator:
-    class: Drupal\rw_generate\Service\AIContentGenerator
-    arguments: ['@http_client', '@file_system', '@module_handler', '@config.factory', '@entity_type.manager', '@entity_field.manager', '@entity_type.bundle.info', '@string_translation', '@password_generator']
+  rw_generate.content_generator:
+    class: Drupal\rw_generate\Service\ContentGenerator
+    arguments: ['@entity_type.manager', '@entity_field.manager', '@password_generator', '@rw_generate.text_generator', '@rw_generate.image_generator', '@config.factory']
+  rw_generate.text_generator:
+    class: Drupal\rw_generate\Service\TextGenerator
+    arguments: ['@http_client', '@config.factory']
+  rw_generate.image_generator:
+    class: Drupal\rw_generate\Service\ImageGenerator
+    arguments: ['@http_client', '@file_system', '@entity_type.manager']

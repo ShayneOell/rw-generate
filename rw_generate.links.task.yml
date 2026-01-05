@@ -2,6 +2,10 @@ rw_generate.form.generation:
   route_name: rw_generate.form
   title: 'Content Generation'
   base_route: rw_generate.form
+rw_generate.form.site_context:
+  route_name: rw_generate.site_context
+  title: 'Site Context'
+  base_route: rw_generate.form
 rw_generate.form.deletion:
   route_name: rw_generate.deletion_form
   title: 'Deletion'
