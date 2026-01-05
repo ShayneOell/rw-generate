@@ -6,6 +6,14 @@ rw_generate.form:
   requirements:
     _permission: 'access administration pages'
 
+rw_generate.site_context:
+  path: '/admin/config/development/rw-generate/site-context'
+  defaults:
+    _form: '\Drupal\rw_generate\Form\SiteContextForm'
+    _title: 'Site Context'
+  requirements:
+    _permission: 'access administration pages'
+
 rw_generate.deletion_form:
   path: '/admin/config/development/rw-generate/delete'
   defaults:
